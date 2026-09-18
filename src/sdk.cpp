@@ -544,9 +544,17 @@ HttpResponse perform_default_http_request(const HttpRequest& request) {
              curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDS, request_body.c_str()) == CURLE_OK &&
              curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE, request_body.size()) == CURLE_OK;
     };
+    const auto set_custom_body = [&] {
+      return curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDS, request_body.c_str()) == CURLE_OK &&
+             curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE, request_body.size()) == CURLE_OK;
+    };
 
-    if (method == "POST" || method == "PATCH" || method == "DELETE") {
+    if (method == "POST") {
       if (!set_post_body()) {
+        throw ProtocolError(ErrorCode::transport_error, "Failed to configure request body");
+      }
+    } else if (method == "PATCH" || method == "DELETE") {
+      if (!set_custom_body()) {
         throw ProtocolError(ErrorCode::transport_error, "Failed to configure request body");
       }
     } else if (method == "PUT") {
