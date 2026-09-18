@@ -1,0 +1,111 @@
+name: Generate SDK from Game Rooms Release
+
+# Reacts to a new Game Rooms Worker release by filing an issue that describes the SDK
+# generation task and assigning it to GitHub's built-in Copilot coding agent. The agent
+# runs in GitHub's cloud (not on an Actions runner) and opens a pull request when done.
+#
+# This workflow is meant to live in repositories CREATED FROM this template (e.g. a
+# per-language SDK repo), not in the template repository itself. It always targets the
+# repository it is running in via ${{ github.repository }} - never a hardcoded name.
+#
+# Trigger contract (repository_dispatch from Game-Rooms/Game-Rooms-Worker):
+#   event_type: game-rooms-release
+#   client_payload:
+#     version: "v1.2.3"          # required - the release tag, used in the issue title
+#     docs_url: "https://..."    # optional - defaults to PROTOCOL.md on Worker's main branch
+#     language: "typescript"     # optional - defaults to typescript
+
+on:
+  repository_dispatch:
+    types: [game-rooms-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Game Rooms Worker release tag (e.g. v1.2.3)"
+        required: true
+        type: string
+      docs_url:
+        description: "URL to the documentation markdown describing the API/service"
+        required: false
+        default: "https://raw.githubusercontent.com/Game-Rooms/Game-Rooms-Worker/refs/heads/main/.github/PROTOCOL.md"
+        type: string
+      language:
+        description: "Target language/platform for the generated SDK"
+        required: false
+        default: "typescript"
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  file-and-assign-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create issue and assign Copilot coding agent
+        env:
+          # Must be a user-to-server token (fine-grained PAT with "Copilot Requests"
+          # permission plus read/write on contents, issues and pull requests). The
+          # built-in GITHUB_TOKEN is a server-to-server token and is NOT accepted by
+          # the issue-assignment / agent APIs.
+          GH_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+          VERSION: ${{ github.event.client_payload.version || inputs.version }}
+          DOCS_URL: ${{ github.event.client_payload.docs_url || inputs.docs_url || 'https://raw.githubusercontent.com/Game-Rooms/Game-Rooms-Worker/refs/heads/main/.github/PROTOCOL.md' }}
+          LANGUAGE: ${{ github.event.client_payload.language || inputs.language || 'typescript' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VERSION:-}" ]; then
+            echo "::error::version is required (client_payload.version or workflow_dispatch input)"
+            exit 1
+          fi
+
+          PROMPT_BODY="$(cat .github/prompts/generate-sdk.md)"
+          ISSUE_BODY="$(printf '%s\n\nDocumentation URL: %s\nTarget SDK language/platform: %s\nGame Rooms Worker version: %s\n' \
+            "$PROMPT_BODY" "$DOCS_URL" "$LANGUAGE" "$VERSION")"
+
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+
+          REPO_ID="$(gh api graphql -f query='
+            query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }
+          ' -f owner="$OWNER" -f name="$REPO" --jq '.data.repository.id')"
+
+          BOT_ID="$(gh api graphql -f query='
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 20) {
+                  nodes { login ... on Bot { id } }
+                }
+              }
+            }
+          ' -f owner="$OWNER" -f name="$REPO" --jq '.data.repository.suggestedActors.nodes[] | select(.login == "copilot-swe-agent") | .id')"
+
+          if [ -z "$BOT_ID" ]; then
+            echo "::error::copilot-swe-agent is not assignable in this repository (coding agent may be disabled)"
+            exit 1
+          fi
+
+          gh api graphql \
+            -H "GraphQL-Features: issues_copilot_assignment_api_support,coding_agent_model_selection" \
+            -f query='
+              mutation($repoId: ID!, $botId: ID!, $title: String!, $body: String!) {
+                createIssue(input: {
+                  repositoryId: $repoId
+                  title: $title
+                  body: $body
+                  assigneeIds: [$botId]
+                  agentAssignment: { targetRepositoryId: $repoId, baseRef: "main" }
+                }) {
+                  issue { number url }
+                }
+              }' \
+            -f repoId="$REPO_ID" \
+            -f botId="$BOT_ID" \
+            -f title="Generate SDK for Game Rooms Worker $VERSION" \
+            -f body="$ISSUE_BODY" \
+            --jq '.data.createIssue.issue'
