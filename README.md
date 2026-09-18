@@ -41,4 +41,5 @@ int main() {
 ```
 
 The default HTTP transport runs `curl` through POSIX process APIs (`fork`/`exec`), so it requires a POSIX environment with `curl` available on `PATH`.
+`HttpApi` now executes real HTTP requests by default when you call `create_room`, `fetch_app_config`, `lookup_room`, or `execute`.
 If you want a custom HTTP implementation, pass your own transport callback to `HttpApi` or set one later with `set_transport`.
