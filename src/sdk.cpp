@@ -537,8 +537,7 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
   }
 
   int stdout_pipe[2];
-  int stderr_pipe[2];
-  if (::pipe(stdout_pipe) != 0 || ::pipe(stderr_pipe) != 0) {
+  if (::pipe(stdout_pipe) != 0) {
     throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport pipes");
   }
 
@@ -546,19 +545,15 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
   if (pid < 0) {
     ::close(stdout_pipe[0]);
     ::close(stdout_pipe[1]);
-    ::close(stderr_pipe[0]);
-    ::close(stderr_pipe[1]);
     throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport process");
   }
 
   if (pid == 0) {
     ::dup2(stdout_pipe[1], STDOUT_FILENO);
-    ::dup2(stderr_pipe[1], STDERR_FILENO);
+    ::dup2(stdout_pipe[1], STDERR_FILENO);
 
     ::close(stdout_pipe[0]);
     ::close(stdout_pipe[1]);
-    ::close(stderr_pipe[0]);
-    ::close(stderr_pipe[1]);
 
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
@@ -572,20 +567,15 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
   }
 
   ::close(stdout_pipe[1]);
-  ::close(stderr_pipe[1]);
 
   std::string stdout_text;
-  std::string stderr_text;
   try {
     stdout_text = read_fd(stdout_pipe[0]);
-    stderr_text = read_fd(stderr_pipe[0]);
   } catch (...) {
     ::close(stdout_pipe[0]);
-    ::close(stderr_pipe[0]);
     throw;
   }
   ::close(stdout_pipe[0]);
-  ::close(stderr_pipe[0]);
 
   int status = 0;
   if (::waitpid(pid, &status, 0) < 0) {
@@ -593,7 +583,7 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
     throw ProtocolError(ErrorCode::transport_error,
-                        stderr_text.empty() ? "Default HTTP transport failed" : trim(stderr_text));
+                        stdout_text.empty() ? "Default HTTP transport failed" : trim(stdout_text));
   }
 
   return parse_http_response(stdout_text);
@@ -769,7 +759,7 @@ std::string Json::dump() const {
 HttpApi::HttpApi(std::string base_url, Transport transport)
     : base_url_(normalize_base_url(std::move(base_url))), transport_(std::move(transport)) {
   if (!transport_) {
-    transport_ = default_transport();
+    transport_ = [](const HttpRequest& request) { return perform_curl_request(request); };
   }
 }
 
@@ -836,11 +826,7 @@ void HttpApi::set_transport(Transport transport) {
     transport_ = std::move(transport);
     return;
   }
-  transport_ = default_transport();
-}
-
-HttpApi::Transport HttpApi::default_transport() {
-  return [](const HttpRequest& request) { return perform_curl_request(request); };
+  transport_ = [](const HttpRequest& request) { return perform_curl_request(request); };
 }
 
 std::optional<ProtocolError> HttpApi::classify_error(const HttpResponse& response) {

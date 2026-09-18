@@ -3,7 +3,7 @@
 A small C++17 SDK for the Game Rooms protocol. It provides:
 
 - HTTP endpoint helpers for creating rooms, fetching app configs, and looking up a room by code
-- Built-in HTTP transport execution via libcurl so requests work out of the box
+- Built-in HTTP transport execution via the `curl` executable so requests work out of the box
 - `ecast`-style WebSocket envelope encoding/decoding
 - Typed helpers for host/player object and relay operations
 - Distinct room-not-found, room-locked, and room-full error classification
@@ -40,4 +40,5 @@ int main() {
 }
 ```
 
+The default HTTP transport runs `curl` through POSIX process APIs (`fork`/`exec`), so it requires a POSIX environment with `curl` available on `PATH`.
 If you want a custom HTTP implementation, pass your own transport callback to `HttpApi` or set one later with `set_transport`.

@@ -104,6 +104,7 @@ struct HttpResponse {
 
 class HttpApi {
  public:
+  // The default transport uses the `curl` executable and is available on POSIX environments.
   using Transport = std::function<HttpResponse(const HttpRequest&)>;
 
   explicit HttpApi(std::string base_url, Transport transport = {});
@@ -122,7 +123,6 @@ class HttpApi {
 
   HttpResponse execute(const HttpRequest& request) const;
   void set_transport(Transport transport);
-  static Transport default_transport();
 
   static std::optional<ProtocolError> classify_error(const HttpResponse& response);
 
