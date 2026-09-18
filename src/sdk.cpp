@@ -413,6 +413,26 @@ std::string trim(std::string value) {
   return std::string(begin, end);
 }
 
+class CurlRuntime {
+ public:
+  CurlRuntime() : initialized_(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK) {}
+  ~CurlRuntime() {
+    if (initialized_) {
+      curl_global_cleanup();
+    }
+  }
+
+  bool initialized() const { return initialized_; }
+
+ private:
+  bool initialized_;
+};
+
+bool ensure_curl_runtime() {
+  static const CurlRuntime runtime;
+  return runtime.initialized();
+}
+
 std::size_t append_curl_body(char* buffer, std::size_t size, std::size_t count, void* userdata) {
   const auto bytes = size * count;
   auto* output = static_cast<std::string*>(userdata);
@@ -455,10 +475,7 @@ HttpResponse perform_default_http_request(const HttpRequest& request) {
     throw ProtocolError(ErrorCode::transport_error, "HTTP method cannot be empty");
   }
 
-  static const bool curl_initialized = [] {
-    return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
-  }();
-  if (!curl_initialized) {
+  if (!ensure_curl_runtime()) {
     throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default HTTP transport");
   }
 
