@@ -18,12 +18,15 @@ using JsonObject = std::map<std::string, Json>;
 
 class Json {
  public:
-  using storage_type = std::variant<std::nullptr_t, bool, double, std::string, JsonArray, JsonObject>;
+  using storage_type =
+      std::variant<std::nullptr_t, bool, std::int64_t, std::uint64_t, double, std::string, JsonArray, JsonObject>;
 
   Json() : value_(nullptr) {}
   Json(std::nullptr_t) : value_(nullptr) {}
   Json(bool value) : value_(value) {}
-  Json(int value) : value_(static_cast<double>(value)) {}
+  Json(int value) : value_(static_cast<std::int64_t>(value)) {}
+  Json(std::int64_t value) : value_(value) {}
+  Json(std::uint64_t value) : value_(value) {}
   Json(double value) : value_(value) {}
   Json(const char* value) : value_(std::string(value)) {}
   Json(std::string value) : value_(std::move(value)) {}
@@ -42,6 +45,8 @@ class Json {
   bool is_object() const;
 
   bool as_bool() const;
+  std::int64_t as_int64() const;
+  std::uint64_t as_uint64() const;
   double as_number() const;
   const std::string& as_string() const;
   const JsonArray& as_array() const;

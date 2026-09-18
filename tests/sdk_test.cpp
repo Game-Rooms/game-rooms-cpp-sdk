@@ -18,10 +18,29 @@ int main() {
   using namespace game_rooms;
 
   {
-    const auto value = Json::parse(R"({"flag":true,"message":"ready","nested":{"round":1},"list":[1,2,3]})");
+    const auto value =
+        Json::parse(R"({"flag":true,"message":"ready \u2603","nested":{"round":1},"list":[1,2,3]})");
     require(value.at("flag").as_bool(), "expected bool field");
     require(value.at("nested").at("round").as_number() == 1.0, "expected nested number");
     require(Json::parse(value.dump()) == value, "expected JSON round trip");
+
+    bool rejected = false;
+    try {
+      static_cast<void>(Json::parse("{\"bad\":\"line\nbreak\"}"));
+    } catch (const ProtocolError&) {
+      rejected = true;
+    }
+    require(rejected, "expected raw control character rejection");
+
+    for (const auto* invalid : {"-", "1.", "1e"}) {
+      bool invalid_rejected = false;
+      try {
+        static_cast<void>(Json::parse(invalid));
+      } catch (const ProtocolError&) {
+        invalid_rejected = true;
+      }
+      require(invalid_rejected, "expected invalid JSON number rejection");
+    }
   }
 
   {
@@ -61,20 +80,24 @@ int main() {
 
     const auto relay = session.relay_to_player("p1", Json::object({{"event", "sync"}}));
     require(relay.opcode == "player/relay", "expected player relay opcode");
+
+    const auto lock = session.lock_object("state", "");
+    require(lock.opcode == "object/lock", "expected default object lock opcode");
   }
 
   {
-    const ClientEnvelope outbound{"number/update", 7, Json::object({{"key", "score"}, {"value", 2}})};
+    constexpr std::uint64_t large_seq = 1844674407370955161ULL;
+    const ClientEnvelope outbound{"number/update", large_seq, Json::object({{"key", "score"}, {"value", 2}})};
     const auto wire = ProtocolCodec::encode(outbound);
     const auto parsed = ProtocolCodec::decode_client(wire);
     require(parsed.opcode == outbound.opcode, "expected client opcode round trip");
     require(parsed.seq == outbound.seq, "expected client seq round trip");
     require(parsed.params.at("key").as_string() == "score", "expected client params round trip");
 
-    const ServerEnvelope inbound{7, "number/update", Json::object({{"ok", true}}), Json("ack")};
+    const ServerEnvelope inbound{large_seq, "number/update", Json::object({{"ok", true}}), Json("ack")};
     const auto inbound_wire = ProtocolCodec::encode(inbound);
     const auto inbound_parsed = ProtocolCodec::decode_server(inbound_wire);
-    require(inbound_parsed.pc.has_value() && *inbound_parsed.pc == 7, "expected server pc");
+    require(inbound_parsed.pc.has_value() && *inbound_parsed.pc == large_seq, "expected server pc");
     require(inbound_parsed.re.has_value() && inbound_parsed.re->as_string() == "ack",
             "expected server re");
   }

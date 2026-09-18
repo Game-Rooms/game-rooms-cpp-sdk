@@ -1,6 +1,7 @@
 #include "game_rooms/sdk.hpp"
 
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string_view>
 
@@ -45,7 +46,7 @@ class JsonParser {
         return Json::object(parse_object());
       default:
         if (input_[pos_] == '-' || std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
-          return Json(parse_number());
+          return parse_number();
         }
         throw ProtocolError(ErrorCode::protocol_error, "Unexpected JSON token");
     }
@@ -103,6 +104,9 @@ class JsonParser {
       if (ch == '"') {
         return out;
       }
+      if (static_cast<unsigned char>(ch) < 0x20) {
+        throw ProtocolError(ErrorCode::protocol_error, "Unescaped control character in JSON string");
+      }
       if (ch != '\\') {
         out.push_back(ch);
         continue;
@@ -133,6 +137,9 @@ class JsonParser {
         case 't':
           out.push_back('\t');
           break;
+        case 'u':
+          append_codepoint(out, parse_codepoint());
+          break;
         default:
           throw ProtocolError(ErrorCode::protocol_error, "Unsupported JSON escape");
       }
@@ -140,30 +147,73 @@ class JsonParser {
     throw ProtocolError(ErrorCode::protocol_error, "Unterminated JSON string");
   }
 
-  double parse_number() {
+  Json parse_number() {
     const std::size_t start = pos_;
     if (input_[pos_] == '-') {
       ++pos_;
     }
-    while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
-      ++pos_;
+
+    if (pos_ >= input_.size()) {
+      throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
     }
-    if (pos_ < input_.size() && input_[pos_] == '.') {
+
+    if (input_[pos_] == '0') {
       ++pos_;
+      if (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+        throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
+      }
+    } else if (std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+      while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+        ++pos_;
+      }
+    } else {
+      throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
+    }
+
+    bool is_integer = true;
+    if (pos_ < input_.size() && input_[pos_] == '.') {
+      is_integer = false;
+      ++pos_;
+      if (pos_ >= input_.size() || !std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+        throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
+      }
       while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
         ++pos_;
       }
     }
     if (pos_ < input_.size() && (input_[pos_] == 'e' || input_[pos_] == 'E')) {
+      is_integer = false;
       ++pos_;
       if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-')) {
         ++pos_;
+      }
+      if (pos_ >= input_.size() || !std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+        throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
       }
       while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
         ++pos_;
       }
     }
-    return std::stod(std::string(input_.substr(start, pos_ - start)));
+
+    const auto token = std::string(input_.substr(start, pos_ - start));
+
+    if (!is_integer) {
+      return Json(std::stod(token));
+    }
+
+    try {
+      if (!token.empty() && token.front() == '-') {
+        return Json(static_cast<std::int64_t>(std::stoll(token)));
+      }
+
+      const auto value = std::stoull(token);
+      if (value <= static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max())) {
+        return Json(static_cast<std::int64_t>(value));
+      }
+      return Json(static_cast<std::uint64_t>(value));
+    } catch (const std::exception&) {
+      throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
+    }
   }
 
   void consume(std::string_view token) {
@@ -183,6 +233,68 @@ class JsonParser {
 
   bool peek(char expected) const {
     return pos_ < input_.size() && input_[pos_] == expected;
+  }
+
+  std::uint32_t parse_codepoint() {
+    auto codepoint = read_hex4();
+    if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+      if (pos_ + 1 >= input_.size() || input_[pos_] != '\\' || input_[pos_ + 1] != 'u') {
+        throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON surrogate pair");
+      }
+      pos_ += 2;
+      const auto low = read_hex4();
+      if (low < 0xDC00 || low > 0xDFFF) {
+        throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON surrogate pair");
+      }
+      return 0x10000u + ((codepoint - 0xD800u) << 10u) + (low - 0xDC00u);
+    }
+    if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+      throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON surrogate pair");
+    }
+    return codepoint;
+  }
+
+  std::uint32_t read_hex4() {
+    if (pos_ + 4 > input_.size()) {
+      throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON unicode escape");
+    }
+    std::uint32_t value = 0;
+    for (int i = 0; i < 4; ++i) {
+      const char ch = input_[pos_++];
+      value <<= 4u;
+      if (ch >= '0' && ch <= '9') {
+        value |= static_cast<std::uint32_t>(ch - '0');
+      } else if (ch >= 'a' && ch <= 'f') {
+        value |= static_cast<std::uint32_t>(ch - 'a' + 10);
+      } else if (ch >= 'A' && ch <= 'F') {
+        value |= static_cast<std::uint32_t>(ch - 'A' + 10);
+      } else {
+        throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON unicode escape");
+      }
+    }
+    return value;
+  }
+
+  static void append_codepoint(std::string& out, std::uint32_t codepoint) {
+    if (codepoint <= 0x7F) {
+      out.push_back(static_cast<char>(codepoint));
+      return;
+    }
+    if (codepoint <= 0x7FF) {
+      out.push_back(static_cast<char>(0xC0u | (codepoint >> 6u)));
+      out.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+      return;
+    }
+    if (codepoint <= 0xFFFF) {
+      out.push_back(static_cast<char>(0xE0u | (codepoint >> 12u)));
+      out.push_back(static_cast<char>(0x80u | ((codepoint >> 6u) & 0x3Fu)));
+      out.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+      return;
+    }
+    out.push_back(static_cast<char>(0xF0u | (codepoint >> 18u)));
+    out.push_back(static_cast<char>(0x80u | ((codepoint >> 12u) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | ((codepoint >> 6u) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
   }
 
   void skip_ws() {
@@ -310,13 +422,54 @@ Json Json::parse(const std::string& input) {
 
 bool Json::is_null() const { return std::holds_alternative<std::nullptr_t>(value_); }
 bool Json::is_bool() const { return std::holds_alternative<bool>(value_); }
-bool Json::is_number() const { return std::holds_alternative<double>(value_); }
+bool Json::is_number() const {
+  return std::holds_alternative<std::int64_t>(value_) || std::holds_alternative<std::uint64_t>(value_) ||
+         std::holds_alternative<double>(value_);
+}
 bool Json::is_string() const { return std::holds_alternative<std::string>(value_); }
 bool Json::is_array() const { return std::holds_alternative<JsonArray>(value_); }
 bool Json::is_object() const { return std::holds_alternative<JsonObject>(value_); }
 
 bool Json::as_bool() const { return std::get<bool>(value_); }
-double Json::as_number() const { return std::get<double>(value_); }
+std::int64_t Json::as_int64() const {
+  if (std::holds_alternative<std::int64_t>(value_)) {
+    return std::get<std::int64_t>(value_);
+  }
+  if (std::holds_alternative<std::uint64_t>(value_)) {
+    const auto value = std::get<std::uint64_t>(value_);
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+      throw std::bad_variant_access();
+    }
+    return static_cast<std::int64_t>(value);
+  }
+  return static_cast<std::int64_t>(std::get<double>(value_));
+}
+std::uint64_t Json::as_uint64() const {
+  if (std::holds_alternative<std::uint64_t>(value_)) {
+    return std::get<std::uint64_t>(value_);
+  }
+  if (std::holds_alternative<std::int64_t>(value_)) {
+    const auto value = std::get<std::int64_t>(value_);
+    if (value < 0) {
+      throw std::bad_variant_access();
+    }
+    return static_cast<std::uint64_t>(value);
+  }
+  const auto value = std::get<double>(value_);
+  if (value < 0) {
+    throw std::bad_variant_access();
+  }
+  return static_cast<std::uint64_t>(value);
+}
+double Json::as_number() const {
+  if (std::holds_alternative<std::int64_t>(value_)) {
+    return static_cast<double>(std::get<std::int64_t>(value_));
+  }
+  if (std::holds_alternative<std::uint64_t>(value_)) {
+    return static_cast<double>(std::get<std::uint64_t>(value_));
+  }
+  return std::get<double>(value_);
+}
 const std::string& Json::as_string() const { return std::get<std::string>(value_); }
 const JsonArray& Json::as_array() const { return std::get<JsonArray>(value_); }
 const JsonObject& Json::as_object() const { return std::get<JsonObject>(value_); }
@@ -340,7 +493,13 @@ std::string Json::dump() const {
   }
   if (is_number()) {
     std::ostringstream out;
-    out << std::setprecision(15) << as_number();
+    if (std::holds_alternative<std::int64_t>(value_)) {
+      out << std::get<std::int64_t>(value_);
+    } else if (std::holds_alternative<std::uint64_t>(value_)) {
+      out << std::get<std::uint64_t>(value_);
+    } else {
+      out << std::setprecision(15) << std::get<double>(value_);
+    }
     return out.str();
   }
   if (is_string()) {
@@ -394,7 +553,7 @@ HttpRequest HttpApi::build_create_room_request(const Json& payload) const {
       "POST",
       create_room_url(),
       {{"content-type", "application/json"}},
-      payload.dump(),
+      std::optional<std::string>(payload.dump()),
   };
 }
 
@@ -403,7 +562,7 @@ HttpRequest HttpApi::build_app_config_request(const std::string& app_id) const {
       "GET",
       app_config_url(app_id),
       {},
-      std::nullopt,
+      {},
   };
 }
 
@@ -412,7 +571,7 @@ HttpRequest HttpApi::build_room_lookup_request(const std::string& code) const {
       "GET",
       room_lookup_url(code),
       {},
-      std::nullopt,
+      {},
   };
 }
 
@@ -423,7 +582,7 @@ std::optional<ProtocolError> HttpApi::classify_error(const HttpResponse& respons
 std::string ProtocolCodec::encode(const ClientEnvelope& message) {
   return Json::object({
       {"opcode", message.opcode},
-      {"seq", static_cast<double>(message.seq)},
+      {"seq", Json(message.seq)},
       {"params", message.params},
   }).dump();
 }
@@ -434,7 +593,7 @@ std::string ProtocolCodec::encode(const ServerEnvelope& message) {
       {"result", message.result},
   };
   if (message.pc.has_value()) {
-    payload.emplace("pc", static_cast<double>(*message.pc));
+    payload.emplace("pc", Json(*message.pc));
   }
   if (message.re.has_value()) {
     payload.emplace("re", *message.re);
@@ -447,7 +606,7 @@ ClientEnvelope ProtocolCodec::decode_client(const std::string& payload) {
   const auto& object = json.as_object();
   return ClientEnvelope{
       object.at("opcode").as_string(),
-      static_cast<std::uint64_t>(object.at("seq").as_number()),
+      object.at("seq").as_uint64(),
       object.at("params"),
   };
 }
@@ -464,7 +623,7 @@ ServerEnvelope ProtocolCodec::decode_server(const std::string& payload) {
   };
 
   if (const auto it = object.find("pc"); it != object.end()) {
-    envelope.pc = static_cast<std::uint64_t>(it->second.as_number());
+    envelope.pc = it->second.as_uint64();
   }
   if (const auto it = object.find("re"); it != object.end()) {
     envelope.re = it->second;
@@ -503,7 +662,8 @@ ClientEnvelope Session::get_object(const std::string& key, const std::string& ty
 }
 
 ClientEnvelope Session::lock_object(const std::string& key, const std::string& type_hint) {
-  return make_request(type_hint + "/lock", Json::object({{"key", key}}));
+  const auto type = type_hint.empty() ? "object" : type_hint;
+  return make_request(type + "/lock", Json::object({{"key", key}}));
 }
 
 ClientEnvelope Session::relay_to_host(const Json& payload) {
