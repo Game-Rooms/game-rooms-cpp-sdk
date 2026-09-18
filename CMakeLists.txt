@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_package(CURL REQUIRED)
+
 add_library(game_rooms
   src/sdk.cpp
 )
@@ -13,6 +15,11 @@ add_library(game_rooms
 target_include_directories(game_rooms
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(game_rooms
+  PUBLIC
+    CURL::libcurl
 )
 
 enable_testing()
