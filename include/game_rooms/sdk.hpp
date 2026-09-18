@@ -157,7 +157,7 @@ class Session {
   ClientEnvelope create_object(const std::string& key, const Json& value);
   ClientEnvelope update_object(const std::string& key, const Json& value);
   ClientEnvelope get_object(const std::string& key, const std::string& type_hint = "");
-  ClientEnvelope lock_object(const std::string& key, const std::string& type_hint = "object");
+  ClientEnvelope lock_object(const std::string& key, const std::string& type_hint = "");
   ClientEnvelope relay_to_host(const Json& payload);
   ClientEnvelope relay_to_player(const std::string& player_id, const Json& payload);
 

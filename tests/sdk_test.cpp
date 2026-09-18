@@ -24,6 +24,10 @@ int main() {
     require(value.at("nested").at("round").as_number() == 1.0, "expected nested number");
     require(Json::parse(value.dump()) == value, "expected JSON round trip");
 
+    const Json control(std::string("\x01", 1));
+    require(control.dump() == "\"\\u0001\"", "expected control character escaping");
+    require(Json::parse(control.dump()) == control, "expected control character round trip");
+
     bool rejected = false;
     try {
       static_cast<void>(Json::parse("{\"bad\":\"line\nbreak\"}"));
@@ -41,6 +45,14 @@ int main() {
       }
       require(invalid_rejected, "expected invalid JSON number rejection");
     }
+
+    bool non_finite_rejected = false;
+    try {
+      static_cast<void>(Json::parse("1e999"));
+    } catch (const ProtocolError&) {
+      non_finite_rejected = true;
+    }
+    require(non_finite_rejected, "expected non-finite JSON number rejection");
   }
 
   {

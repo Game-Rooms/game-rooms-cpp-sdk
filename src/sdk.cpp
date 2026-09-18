@@ -1,12 +1,17 @@
 #include "game_rooms/sdk.hpp"
 
 #include <iomanip>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <string_view>
 
 namespace game_rooms {
 namespace {
+
+bool is_json_whitespace(char ch) {
+  return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+}
 
 class JsonParser {
  public:
@@ -198,7 +203,17 @@ class JsonParser {
     const auto token = std::string(input_.substr(start, pos_ - start));
 
     if (!is_integer) {
-      return Json(std::stod(token));
+      try {
+        const auto value = std::stod(token);
+        if (!std::isfinite(value)) {
+          throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
+        }
+        return Json(value);
+      } catch (const ProtocolError&) {
+        throw;
+      } catch (const std::exception&) {
+        throw ProtocolError(ErrorCode::protocol_error, "Invalid JSON number");
+      }
     }
 
     try {
@@ -298,7 +313,7 @@ class JsonParser {
   }
 
   void skip_ws() {
-    while (pos_ < input_.size() && std::isspace(static_cast<unsigned char>(input_[pos_]))) {
+    while (pos_ < input_.size() && is_json_whitespace(input_[pos_])) {
       ++pos_;
     }
   }
@@ -309,6 +324,7 @@ class JsonParser {
 
 std::string escape_json(const std::string& value) {
   std::ostringstream out;
+  out << std::uppercase << std::hex;
   for (const char ch : value) {
     switch (ch) {
       case '"':
@@ -333,12 +349,19 @@ std::string escape_json(const std::string& value) {
         out << "\\t";
         break;
       default:
-        out << ch;
+        if (static_cast<unsigned char>(ch) < 0x20) {
+          out << "\\u" << std::setw(4) << std::setfill('0')
+              << static_cast<int>(static_cast<unsigned char>(ch));
+        } else {
+          out << ch;
+        }
         break;
     }
   }
   return out.str();
 }
+
+
 
 std::string url_encode(std::string_view value) {
   std::ostringstream out;
