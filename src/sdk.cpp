@@ -484,7 +484,7 @@ HttpResponse perform_default_http_request(const HttpRequest& request) {
 
   if (curl_easy_setopt(handle.get(), CURLOPT_URL, request.path.c_str()) != CURLE_OK ||
       curl_easy_setopt(handle.get(), CURLOPT_CUSTOMREQUEST, method.c_str()) != CURLE_OK ||
-      curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 1L) != CURLE_OK ||
+      curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK ||
       curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, &append_curl_body) != CURLE_OK ||
       curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &response_body) != CURLE_OK ||
       curl_easy_setopt(handle.get(), CURLOPT_HEADERFUNCTION, &append_curl_header) != CURLE_OK ||
