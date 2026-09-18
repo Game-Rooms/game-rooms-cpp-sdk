@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cerrno>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <stdexcept>
@@ -437,14 +436,11 @@ std::string read_fd(int fd) {
   return output;
 }
 
-std::string read_file(const std::string& path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    throw ProtocolError(ErrorCode::transport_error, "Failed to read default transport headers");
+std::string read_seekable_fd(int fd) {
+  if (::lseek(fd, 0, SEEK_SET) < 0) {
+    throw ProtocolError(ErrorCode::transport_error, "Failed to seek default transport header output");
   }
-  std::ostringstream output;
-  output << input.rdbuf();
-  return output.str();
+  return read_fd(fd);
 }
 
 std::string find_last_status_block(const std::string& headers_text) {
@@ -539,14 +535,14 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
   if (header_fd < 0) {
     throw ProtocolError(ErrorCode::transport_error, "Failed to create default transport header file");
   }
-  ::close(header_fd);
-  const std::string header_file_path(header_file_template);
+  ::unlink(header_file_template);
+  const std::string header_file_path = "/proc/self/fd/" + std::to_string(header_fd);
   args.push_back("--dump-header");
   args.push_back(header_file_path);
 
   int stdout_pipe[2];
   if (::pipe(stdout_pipe) != 0) {
-    ::unlink(header_file_path.c_str());
+    ::close(header_fd);
     throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport pipes");
   }
 
@@ -554,7 +550,7 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
   if (pid < 0) {
     ::close(stdout_pipe[0]);
     ::close(stdout_pipe[1]);
-    ::unlink(header_file_path.c_str());
+    ::close(header_fd);
     throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport process");
   }
 
@@ -590,23 +586,23 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
 
   int status = 0;
   if (::waitpid(pid, &status, 0) < 0) {
-    ::unlink(header_file_path.c_str());
+    ::close(header_fd);
     throw ProtocolError(ErrorCode::transport_error, "Failed waiting for default transport process");
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    ::unlink(header_file_path.c_str());
+    ::close(header_fd);
     throw ProtocolError(ErrorCode::transport_error,
                         stdout_text.empty() ? "Default HTTP transport failed" : trim(stdout_text));
   }
 
   std::string headers_text;
   try {
-    headers_text = read_file(header_file_path);
+    headers_text = read_seekable_fd(header_fd);
   } catch (...) {
-    ::unlink(header_file_path.c_str());
+    ::close(header_fd);
     throw;
   }
-  ::unlink(header_file_path.c_str());
+  ::close(header_fd);
   return parse_http_response(headers_text, std::move(stdout_text));
 }
 

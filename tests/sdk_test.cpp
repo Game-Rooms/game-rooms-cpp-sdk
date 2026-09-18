@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
@@ -17,6 +18,15 @@ void require(bool condition, const char* message) {
     std::exit(1);
   }
 }
+
+class ScopeExit {
+ public:
+  explicit ScopeExit(std::function<void()> fn) : fn_(std::move(fn)) {}
+  ~ScopeExit() { fn_(); }
+
+ private:
+  std::function<void()> fn_;
+};
 
 }  // namespace
 
@@ -124,6 +134,11 @@ int main() {
 
     const std::string test_path = std::string(temp_dir) + (path_backup.empty() ? "" : ":" + path_backup);
     require(::setenv("PATH", test_path.c_str(), 1) == 0, "expected PATH override for curl stub");
+    ScopeExit cleanup([&] {
+      ::setenv("PATH", path_backup.c_str(), 1);
+      ::unlink(curl_script_path.c_str());
+      ::rmdir(temp_dir);
+    });
 
     HttpApi api("https://example.com");
     const auto response = api.fetch_app_config("drawful");
@@ -138,10 +153,6 @@ int main() {
       empty_method_rejected = error.code() == ErrorCode::transport_error;
     }
     require(empty_method_rejected, "expected empty-method rejection in default transport");
-
-    require(::setenv("PATH", path_backup.c_str(), 1) == 0, "expected PATH restore");
-    require(::unlink(curl_script_path.c_str()) == 0, "expected cleanup of curl stub");
-    require(::rmdir(temp_dir) == 0, "expected cleanup of temp dir");
   }
 
   {
