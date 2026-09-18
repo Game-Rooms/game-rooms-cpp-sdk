@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -440,6 +441,26 @@ std::size_t append_curl_body(char* buffer, std::size_t size, std::size_t count, 
   return bytes;
 }
 
+struct CurlRequestBodyCursor {
+  const char* data{nullptr};
+  std::size_t size{0};
+  std::size_t offset{0};
+};
+
+std::size_t read_curl_body(char* buffer, std::size_t size, std::size_t count, void* userdata) {
+  const auto capacity = size * count;
+  auto* cursor = static_cast<CurlRequestBodyCursor*>(userdata);
+  const auto remaining = cursor->size - cursor->offset;
+  const auto chunk_size = std::min(capacity, remaining);
+  if (chunk_size == 0) {
+    return 0;
+  }
+
+  std::memcpy(buffer, cursor->data + cursor->offset, chunk_size);
+  cursor->offset += chunk_size;
+  return chunk_size;
+}
+
 std::size_t append_curl_header(char* buffer, std::size_t size, std::size_t count, void* userdata) {
   const auto bytes = size * count;
   std::string line(buffer, bytes);
@@ -515,11 +536,30 @@ HttpResponse perform_default_http_request(const HttpRequest& request) {
   }
 
   std::string request_body;
+  CurlRequestBodyCursor request_body_cursor;
   if (request.body.has_value()) {
     request_body = *request.body;
-    if (curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDS, request_body.c_str()) != CURLE_OK ||
-        curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE, request_body.size()) != CURLE_OK) {
-      throw ProtocolError(ErrorCode::transport_error, "Failed to configure request body");
+    const auto set_post_body = [&] {
+      return curl_easy_setopt(handle.get(), CURLOPT_POST, 1L) == CURLE_OK &&
+             curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDS, request_body.c_str()) == CURLE_OK &&
+             curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE, request_body.size()) == CURLE_OK;
+    };
+
+    if (method == "POST" || method == "PATCH" || method == "DELETE") {
+      if (!set_post_body()) {
+        throw ProtocolError(ErrorCode::transport_error, "Failed to configure request body");
+      }
+    } else if (method == "PUT") {
+      request_body_cursor = CurlRequestBodyCursor{request_body.data(), request_body.size(), 0};
+      if (curl_easy_setopt(handle.get(), CURLOPT_UPLOAD, 1L) != CURLE_OK ||
+          curl_easy_setopt(handle.get(), CURLOPT_READFUNCTION, &read_curl_body) != CURLE_OK ||
+          curl_easy_setopt(handle.get(), CURLOPT_READDATA, &request_body_cursor) != CURLE_OK ||
+          curl_easy_setopt(handle.get(), CURLOPT_INFILESIZE_LARGE,
+                           static_cast<curl_off_t>(request_body.size())) != CURLE_OK) {
+        throw ProtocolError(ErrorCode::transport_error, "Failed to configure request body");
+      }
+    } else {
+      throw ProtocolError(ErrorCode::transport_error, "Default transport does not support bodies for this method");
     }
   }
 
