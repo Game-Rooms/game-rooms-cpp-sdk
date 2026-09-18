@@ -1,7 +1,13 @@
 #include "game_rooms/sdk.hpp"
 
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace {
 
@@ -88,6 +94,54 @@ int main() {
     require(config.status_code == 201, "expected replaced transport status");
     require(seen_requests.size() == 2, "expected two custom transport requests");
     require(seen_requests.back().path == "https://example.com/apps/drawful/config", "expected app-config request path");
+  }
+
+  {
+    const char* original_path = std::getenv("PATH");
+    std::string path_backup = original_path == nullptr ? "" : original_path;
+
+    char temp_dir_template[] = "/tmp/game-rooms-cpp-sdk-tests-XXXXXX";
+    char* temp_dir = ::mkdtemp(temp_dir_template);
+    require(temp_dir != nullptr, "expected temp dir for default transport test");
+
+    const std::string curl_script_path = std::string(temp_dir) + "/curl";
+    {
+      std::ofstream script(curl_script_path);
+      script << "#!/bin/sh\n";
+      script << "header_file=\"\"\n";
+      script << "while [ \"$#\" -gt 0 ]; do\n";
+      script << "  if [ \"$1\" = \"--dump-header\" ]; then\n";
+      script << "    shift\n";
+      script << "    header_file=\"$1\"\n";
+      script << "  fi\n";
+      script << "  shift\n";
+      script << "done\n";
+      script << "printf 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n' > \"$header_file\"\n";
+      script << "printf '{\"ok\":true}'\n";
+      script << "exit 0\n";
+    }
+    require(::chmod(curl_script_path.c_str(), 0700) == 0, "expected executable curl stub");
+
+    const std::string test_path = std::string(temp_dir) + (path_backup.empty() ? "" : ":" + path_backup);
+    require(::setenv("PATH", test_path.c_str(), 1) == 0, "expected PATH override for curl stub");
+
+    HttpApi api("https://example.com");
+    const auto response = api.fetch_app_config("drawful");
+    require(response.status_code == 200, "expected default transport status");
+    require(response.body == R"({"ok":true})", "expected default transport body");
+    require(response.headers.at("content-type") == "application/json", "expected default transport header");
+
+    bool empty_method_rejected = false;
+    try {
+      static_cast<void>(api.execute(HttpRequest{"", "https://example.com", {}, {}}));
+    } catch (const ProtocolError& error) {
+      empty_method_rejected = error.code() == ErrorCode::transport_error;
+    }
+    require(empty_method_rejected, "expected empty-method rejection in default transport");
+
+    require(::setenv("PATH", path_backup.c_str(), 1) == 0, "expected PATH restore");
+    require(::unlink(curl_script_path.c_str()) == 0, "expected cleanup of curl stub");
+    require(::rmdir(temp_dir) == 0, "expected cleanup of temp dir");
   }
 
   {

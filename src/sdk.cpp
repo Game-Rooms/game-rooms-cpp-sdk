@@ -4,11 +4,13 @@
 #include <cmath>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <sstream>
 #include <string_view>
+#include <string>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -435,43 +437,40 @@ std::string read_fd(int fd) {
   return output;
 }
 
-std::pair<std::string, std::string> split_headers_and_body(const std::string& response) {
-  std::size_t cursor = 0;
-  std::string header_block;
-
-  while (cursor < response.size() && response.compare(cursor, 5, "HTTP/") == 0) {
-    const auto header_end_crlf = response.find("\r\n\r\n", cursor);
-    const auto header_end_lf = response.find("\n\n", cursor);
-
-    std::size_t header_end = std::string::npos;
-    std::size_t separator_size = 0;
-    if (header_end_crlf != std::string::npos &&
-        (header_end_lf == std::string::npos || header_end_crlf < header_end_lf)) {
-      header_end = header_end_crlf;
-      separator_size = 4;
-    } else if (header_end_lf != std::string::npos) {
-      header_end = header_end_lf;
-      separator_size = 2;
-    }
-
-    if (header_end == std::string::npos) {
-      throw ProtocolError(ErrorCode::transport_error, "Malformed HTTP response from default transport");
-    }
-
-    header_block = response.substr(cursor, header_end - cursor);
-    cursor = header_end + separator_size;
+std::string read_file(const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw ProtocolError(ErrorCode::transport_error, "Failed to read default transport headers");
   }
-
-  if (header_block.empty()) {
-    throw ProtocolError(ErrorCode::transport_error, "Missing HTTP headers in default transport response");
-  }
-
-  return {header_block, response.substr(cursor)};
+  std::ostringstream output;
+  output << input.rdbuf();
+  return output.str();
 }
 
-HttpResponse parse_http_response(const std::string& response) {
-  const auto [header_block, body] = split_headers_and_body(response);
-  std::istringstream header_stream(header_block);
+std::string find_last_status_block(const std::string& headers_text) {
+  std::size_t cursor = 0;
+  std::string last_block;
+
+  while (cursor < headers_text.size()) {
+    const auto block_end = headers_text.find("\r\n\r\n", cursor);
+    if (block_end == std::string::npos) {
+      break;
+    }
+    const auto block = headers_text.substr(cursor, block_end - cursor);
+    if (block.rfind("HTTP/", 0) == 0) {
+      last_block = block;
+    }
+    cursor = block_end + 4;
+  }
+
+  if (last_block.empty()) {
+    throw ProtocolError(ErrorCode::transport_error, "Missing HTTP headers in default transport response");
+  }
+  return last_block;
+}
+
+HttpResponse parse_http_response(const std::string& headers_text, std::string body) {
+  std::istringstream header_stream(find_last_status_block(headers_text));
 
   std::string status_line;
   if (!std::getline(header_stream, status_line)) {
@@ -507,7 +506,7 @@ HttpResponse parse_http_response(const std::string& response) {
     }
   }
 
-  return HttpResponse{status_code, std::move(headers), body};
+  return HttpResponse{status_code, std::move(headers), std::move(body)};
 }
 
 HttpResponse perform_curl_request(const HttpRequest& request) {
@@ -521,7 +520,6 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
       "--silent",
       "--show-error",
       "--location",
-      "--include",
       "--request",
       method,
       "--url",
@@ -536,8 +534,19 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
     args.push_back(*request.body);
   }
 
+  char header_file_template[] = "/tmp/game-rooms-cpp-sdk-curl-headers-XXXXXX";
+  const int header_fd = ::mkstemp(header_file_template);
+  if (header_fd < 0) {
+    throw ProtocolError(ErrorCode::transport_error, "Failed to create default transport header file");
+  }
+  ::close(header_fd);
+  const std::string header_file_path(header_file_template);
+  args.push_back("--dump-header");
+  args.push_back(header_file_path);
+
   int stdout_pipe[2];
   if (::pipe(stdout_pipe) != 0) {
+    ::unlink(header_file_path.c_str());
     throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport pipes");
   }
 
@@ -545,12 +554,14 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
   if (pid < 0) {
     ::close(stdout_pipe[0]);
     ::close(stdout_pipe[1]);
+    ::unlink(header_file_path.c_str());
     throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport process");
   }
 
   if (pid == 0) {
-    ::dup2(stdout_pipe[1], STDOUT_FILENO);
-    ::dup2(stdout_pipe[1], STDERR_FILENO);
+    if (::dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || ::dup2(stdout_pipe[1], STDERR_FILENO) < 0) {
+      _exit(126);
+    }
 
     ::close(stdout_pipe[0]);
     ::close(stdout_pipe[1]);
@@ -579,14 +590,24 @@ HttpResponse perform_curl_request(const HttpRequest& request) {
 
   int status = 0;
   if (::waitpid(pid, &status, 0) < 0) {
+    ::unlink(header_file_path.c_str());
     throw ProtocolError(ErrorCode::transport_error, "Failed waiting for default transport process");
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    ::unlink(header_file_path.c_str());
     throw ProtocolError(ErrorCode::transport_error,
                         stdout_text.empty() ? "Default HTTP transport failed" : trim(stdout_text));
   }
 
-  return parse_http_response(stdout_text);
+  std::string headers_text;
+  try {
+    headers_text = read_file(header_file_path);
+  } catch (...) {
+    ::unlink(header_file_path.c_str());
+    throw;
+  }
+  ::unlink(header_file_path.c_str());
+  return parse_http_response(headers_text, std::move(stdout_text));
 }
 
 std::optional<std::string> extract_error_text(const std::string& body) {
