@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -103,7 +104,9 @@ struct HttpResponse {
 
 class HttpApi {
  public:
-  explicit HttpApi(std::string base_url);
+  using Transport = std::function<HttpResponse(const HttpRequest&)>;
+
+  explicit HttpApi(std::string base_url, Transport transport = {});
 
   const std::string& base_url() const { return base_url_; }
   std::string create_room_url() const;
@@ -113,11 +116,19 @@ class HttpApi {
   HttpRequest build_create_room_request(const Json& payload) const;
   HttpRequest build_app_config_request(const std::string& app_id) const;
   HttpRequest build_room_lookup_request(const std::string& code) const;
+  HttpResponse create_room(const Json& payload) const;
+  HttpResponse fetch_app_config(const std::string& app_id) const;
+  HttpResponse lookup_room(const std::string& code) const;
+
+  HttpResponse execute(const HttpRequest& request) const;
+  void set_transport(Transport transport);
+  static Transport default_transport();
 
   static std::optional<ProtocolError> classify_error(const HttpResponse& response);
 
  private:
   std::string base_url_;
+  Transport transport_;
 };
 
 enum class Role {

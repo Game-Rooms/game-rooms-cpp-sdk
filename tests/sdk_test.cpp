@@ -69,6 +69,28 @@ int main() {
   }
 
   {
+    std::vector<HttpRequest> seen_requests;
+    HttpApi api("https://example.com", [&](const HttpRequest& request) {
+      seen_requests.push_back(request);
+      return HttpResponse{200, {{"content-type", "application/json"}}, R"({"ok":true})"};
+    });
+
+    const auto create = api.create_room(Json::object({{"appId", "fibbage"}}));
+    require(create.status_code == 200, "expected custom transport status");
+    require(seen_requests.size() == 1, "expected one custom transport request");
+    require(seen_requests.front().path == "https://example.com/rooms", "expected create-room request path");
+
+    api.set_transport([&](const HttpRequest& request) {
+      seen_requests.push_back(request);
+      return HttpResponse{201, {}, ""};
+    });
+    const auto config = api.fetch_app_config("drawful");
+    require(config.status_code == 201, "expected replaced transport status");
+    require(seen_requests.size() == 2, "expected two custom transport requests");
+    require(seen_requests.back().path == "https://example.com/apps/drawful/config", "expected app-config request path");
+  }
+
+  {
     const auto error = HttpApi::classify_error(HttpResponse{404, {}, R"({"error":"room-not-found"})"});
     require(error.has_value() && error->code() == ErrorCode::room_not_found, "expected room-not-found");
 

@@ -3,6 +3,7 @@
 A small C++17 SDK for the Game Rooms protocol. It provides:
 
 - HTTP endpoint helpers for creating rooms, fetching app configs, and looking up a room by code
+- Built-in HTTP transport execution via libcurl so requests work out of the box
 - `ecast`-style WebSocket envelope encoding/decoding
 - Typed helpers for host/player object and relay operations
 - Distinct room-not-found, room-locked, and room-full error classification
@@ -23,7 +24,7 @@ ctest --test-dir build --output-on-failure
 
 int main() {
   game_rooms::HttpApi api("https://example.com");
-  auto create_request = api.build_create_room_request(game_rooms::Json::object({
+  auto create_response = api.create_room(game_rooms::Json::object({
     {"appId", "fibbage"},
     {"audienceEnabled", true}
   }));
@@ -34,9 +35,9 @@ int main() {
     {"prompt", "ready"}
   }));
 
-  std::cout << create_request.path << "\n";
+  std::cout << create_response.status_code << "\n";
   std::cout << game_rooms::ProtocolCodec::encode(message) << "\n";
 }
 ```
 
-The SDK is transport-agnostic: use the generated HTTP requests with your preferred HTTP client and send encoded WebSocket envelopes over your preferred WebSocket implementation.
+If you want a custom HTTP implementation, pass your own transport callback to `HttpApi` or set one later with `set_transport`.

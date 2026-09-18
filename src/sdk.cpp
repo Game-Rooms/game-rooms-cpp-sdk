@@ -1,10 +1,18 @@
 #include "game_rooms/sdk.hpp"
 
-#include <iomanip>
+#include <algorithm>
 #include <cmath>
+#include <cerrno>
+#include <cstring>
+#include <iomanip>
 #include <limits>
+#include <stdexcept>
 #include <sstream>
 #include <string_view>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 namespace game_rooms {
 namespace {
@@ -390,6 +398,207 @@ std::string normalize_base_url(std::string base_url) {
   return base_url;
 }
 
+std::string to_lower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value;
+}
+
+std::string trim(std::string value) {
+  const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+  auto begin = std::find_if_not(value.begin(), value.end(), is_space);
+  auto end = std::find_if_not(value.rbegin(), value.rend(), is_space).base();
+  if (begin >= end) {
+    return {};
+  }
+  return std::string(begin, end);
+}
+
+std::string read_fd(int fd) {
+  std::string output;
+  char buffer[4096];
+  while (true) {
+    const ssize_t read_count = ::read(fd, buffer, sizeof(buffer));
+    if (read_count > 0) {
+      output.append(buffer, static_cast<std::size_t>(read_count));
+      continue;
+    }
+    if (read_count == 0) {
+      break;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    throw ProtocolError(ErrorCode::transport_error, std::strerror(errno));
+  }
+  return output;
+}
+
+std::pair<std::string, std::string> split_headers_and_body(const std::string& response) {
+  std::size_t cursor = 0;
+  std::string header_block;
+
+  while (cursor < response.size() && response.compare(cursor, 5, "HTTP/") == 0) {
+    const auto header_end_crlf = response.find("\r\n\r\n", cursor);
+    const auto header_end_lf = response.find("\n\n", cursor);
+
+    std::size_t header_end = std::string::npos;
+    std::size_t separator_size = 0;
+    if (header_end_crlf != std::string::npos &&
+        (header_end_lf == std::string::npos || header_end_crlf < header_end_lf)) {
+      header_end = header_end_crlf;
+      separator_size = 4;
+    } else if (header_end_lf != std::string::npos) {
+      header_end = header_end_lf;
+      separator_size = 2;
+    }
+
+    if (header_end == std::string::npos) {
+      throw ProtocolError(ErrorCode::transport_error, "Malformed HTTP response from default transport");
+    }
+
+    header_block = response.substr(cursor, header_end - cursor);
+    cursor = header_end + separator_size;
+  }
+
+  if (header_block.empty()) {
+    throw ProtocolError(ErrorCode::transport_error, "Missing HTTP headers in default transport response");
+  }
+
+  return {header_block, response.substr(cursor)};
+}
+
+HttpResponse parse_http_response(const std::string& response) {
+  const auto [header_block, body] = split_headers_and_body(response);
+  std::istringstream header_stream(header_block);
+
+  std::string status_line;
+  if (!std::getline(header_stream, status_line)) {
+    throw ProtocolError(ErrorCode::transport_error, "Missing HTTP status line");
+  }
+  status_line = trim(status_line);
+  if (!status_line.empty() && status_line.back() == '\r') {
+    status_line.pop_back();
+  }
+
+  std::istringstream status_stream(status_line);
+  std::string http_version;
+  int status_code = 0;
+  status_stream >> http_version >> status_code;
+  if (http_version.rfind("HTTP/", 0) != 0 || status_code <= 0) {
+    throw ProtocolError(ErrorCode::transport_error, "Invalid HTTP status line from default transport");
+  }
+
+  std::map<std::string, std::string> headers;
+  for (std::string line; std::getline(header_stream, line);) {
+    line = trim(line);
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    const auto separator = line.find(':');
+    if (separator == std::string::npos) {
+      continue;
+    }
+    auto key = to_lower(trim(line.substr(0, separator)));
+    auto value = trim(line.substr(separator + 1));
+    if (!key.empty()) {
+      headers[std::move(key)] = std::move(value);
+    }
+  }
+
+  return HttpResponse{status_code, std::move(headers), body};
+}
+
+HttpResponse perform_curl_request(const HttpRequest& request) {
+  const auto method = upper(request.method);
+  if (method.empty()) {
+    throw ProtocolError(ErrorCode::transport_error, "HTTP method cannot be empty");
+  }
+
+  std::vector<std::string> args{
+      "curl",
+      "--silent",
+      "--show-error",
+      "--location",
+      "--include",
+      "--request",
+      method,
+      "--url",
+      request.path,
+  };
+  for (const auto& [name, value] : request.headers) {
+    args.push_back("--header");
+    args.push_back(name + ": " + value);
+  }
+  if (request.body.has_value()) {
+    args.push_back("--data-binary");
+    args.push_back(*request.body);
+  }
+
+  int stdout_pipe[2];
+  int stderr_pipe[2];
+  if (::pipe(stdout_pipe) != 0 || ::pipe(stderr_pipe) != 0) {
+    throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport pipes");
+  }
+
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    ::close(stdout_pipe[0]);
+    ::close(stdout_pipe[1]);
+    ::close(stderr_pipe[0]);
+    ::close(stderr_pipe[1]);
+    throw ProtocolError(ErrorCode::transport_error, "Failed to initialize default transport process");
+  }
+
+  if (pid == 0) {
+    ::dup2(stdout_pipe[1], STDOUT_FILENO);
+    ::dup2(stderr_pipe[1], STDERR_FILENO);
+
+    ::close(stdout_pipe[0]);
+    ::close(stdout_pipe[1]);
+    ::close(stderr_pipe[0]);
+    ::close(stderr_pipe[1]);
+
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (auto& arg : args) {
+      argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    ::execvp("curl", argv.data());
+    _exit(127);
+  }
+
+  ::close(stdout_pipe[1]);
+  ::close(stderr_pipe[1]);
+
+  std::string stdout_text;
+  std::string stderr_text;
+  try {
+    stdout_text = read_fd(stdout_pipe[0]);
+    stderr_text = read_fd(stderr_pipe[0]);
+  } catch (...) {
+    ::close(stdout_pipe[0]);
+    ::close(stderr_pipe[0]);
+    throw;
+  }
+  ::close(stdout_pipe[0]);
+  ::close(stderr_pipe[0]);
+
+  int status = 0;
+  if (::waitpid(pid, &status, 0) < 0) {
+    throw ProtocolError(ErrorCode::transport_error, "Failed waiting for default transport process");
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    throw ProtocolError(ErrorCode::transport_error,
+                        stderr_text.empty() ? "Default HTTP transport failed" : trim(stderr_text));
+  }
+
+  return parse_http_response(stdout_text);
+}
+
 std::optional<std::string> extract_error_text(const std::string& body) {
   if (body.empty()) {
     return std::nullopt;
@@ -557,7 +766,12 @@ std::string Json::dump() const {
   return out.str();
 }
 
-HttpApi::HttpApi(std::string base_url) : base_url_(normalize_base_url(std::move(base_url))) {}
+HttpApi::HttpApi(std::string base_url, Transport transport)
+    : base_url_(normalize_base_url(std::move(base_url))), transport_(std::move(transport)) {
+  if (!transport_) {
+    transport_ = default_transport();
+  }
+}
 
 std::string HttpApi::create_room_url() const {
   return base_url_ + "/rooms";
@@ -596,6 +810,37 @@ HttpRequest HttpApi::build_room_lookup_request(const std::string& code) const {
       {},
       {},
   };
+}
+
+HttpResponse HttpApi::create_room(const Json& payload) const {
+  return execute(build_create_room_request(payload));
+}
+
+HttpResponse HttpApi::fetch_app_config(const std::string& app_id) const {
+  return execute(build_app_config_request(app_id));
+}
+
+HttpResponse HttpApi::lookup_room(const std::string& code) const {
+  return execute(build_room_lookup_request(code));
+}
+
+HttpResponse HttpApi::execute(const HttpRequest& request) const {
+  if (!transport_) {
+    throw ProtocolError(ErrorCode::transport_error, "HTTP transport is not configured");
+  }
+  return transport_(request);
+}
+
+void HttpApi::set_transport(Transport transport) {
+  if (transport) {
+    transport_ = std::move(transport);
+    return;
+  }
+  transport_ = default_transport();
+}
+
+HttpApi::Transport HttpApi::default_transport() {
+  return [](const HttpRequest& request) { return perform_curl_request(request); };
 }
 
 std::optional<ProtocolError> HttpApi::classify_error(const HttpResponse& response) {
